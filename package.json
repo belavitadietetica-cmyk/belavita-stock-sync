@@ -1,0 +1,15 @@
+{
+  "name": "belavita-stock-sync",
+  "version": "1.0.0",
+  "description": "Sincroniza stock de Belavita Ops (Supabase, schema ops) hacia Tienda Nube. Batch cada 15 minutos, autocorrectivo, con modo reporte (DRY_RUN).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0"
+  }
+}
