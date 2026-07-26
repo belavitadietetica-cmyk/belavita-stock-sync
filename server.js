@@ -51,30 +51,39 @@ let corriendo = false;
 // 1) LECTURA DE SUPABASE
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Trae TODAS las filas de una tabla del schema ops, paginando de a 1000.
+// (Supabase corta en 1000 por consulta; sin esto veríamos solo una parte.)
+async function traerTodo(tabla, columnas) {
+  const PAGINA = 1000;
+  let desde = 0;
+  let todo = [];
+  while (true) {
+    const { data, error } = await sb.schema('ops')
+      .from(tabla)
+      .select(columnas)
+      .range(desde, desde + PAGINA - 1);
+    if (error) throw new Error(`Leyendo ops.${tabla}: ${error.message}`);
+    todo = todo.concat(data);
+    if (!data || data.length < PAGINA) break; // última tanda
+    desde += PAGINA;
+  }
+  return todo;
+}
+
 async function cargarDatosOps() {
-  // Productos: todo lo que necesita el motor de cálculo.
-  const { data: productos, error: e1 } = await sb.schema('ops')
-    .from('productos')
-    .select('id, codigo, nombre, tipo_venta, kg_por_unidad, producto_bulk_id, stock_kg_actual');
-  if (e1) throw new Error('Leyendo ops.productos: ' + e1.message);
-
-  // Stock por sucursal (la cantidad por presentación individual en cada local).
-  const { data: stockSuc, error: e2 } = await sb.schema('ops')
-    .from('stock_sucursal')
-    .select('producto_id, sucursal_id, cantidad');
-  if (e2) throw new Error('Leyendo ops.stock_sucursal: ' + e2.message);
-
-  // Componentes de cada combo.
-  const { data: combos, error: e3 } = await sb.schema('ops')
-    .from('combo_componentes')
-    .select('combo_codigo, componente_codigo, cantidad');
-  if (e3) throw new Error('Leyendo ops.combo_componentes: ' + e3.message);
+  // IMPORTANTE: Supabase (PostgREST) devuelve máximo 1000 filas por consulta.
+  // Nuestras tablas son más grandes (productos y stock_sucursal pasan las 1000),
+  // así que hay que paginar con .range() y traer TODO en tandas, o si no el sync
+  // ve solo una parte del catálogo y del stock.
+  const productos = await traerTodo('productos', 'id, codigo, nombre, tipo_venta, kg_por_unidad, producto_bulk_id, stock_kg_actual');
+  const stockSuc  = await traerTodo('stock_sucursal', 'producto_id, sucursal_id, cantidad');
+  const combos    = await traerTodo('combo_componentes', 'combo_codigo, componente_codigo, cantidad');
 
   // ── Índices en memoria para no consultar de a uno ──
   const porCodigo = new Map();   // codigo(text) -> producto
   const porId     = new Map();   // id(number)   -> producto
   for (const p of productos) {
-    if (p.codigo != null) porCodigo.set(String(p.codigo), p);
+    if (p.codigo != null) porCodigo.set(String(p.codigo).trim(), p);
     porId.set(Number(p.id), p);
   }
 
@@ -106,7 +115,7 @@ async function cargarDatosOps() {
 
 function calcularStock(codigo, ctx, visitados = new Set()) {
   const { porCodigo, porId, stockFisicoPorId, componentesPorCombo } = ctx;
-  const p = porCodigo.get(String(codigo));
+  const p = porCodigo.get(String(codigo).trim());
   if (!p) return null; // no existe en Ops → no se toca en TN
 
   // Protección anti-bucle (combo que se referencie a sí mismo, etc.)
