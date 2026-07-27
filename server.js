@@ -32,9 +32,10 @@ const SUCURSALES_FISICAS = ['bv1', 'bv2', 'bv3'];
 const MARGEN_GRANEL_KG = 1;
 // Margen de venta que Tienda Nube debe reflejar sobre el precio de Ops.
 const MARGEN_TIENDA = 1.10;
-// Tolerancia para no marcar como "desvío" simples diferencias de redondeo.
-const TOLERANCIA_PESOS = 3;
-const TOLERANCIA_PCT = 0.5; // %
+// Tolerancia para no marcar como "desvío" simples diferencias de redondeo comercial
+// (redondear el precio final a la centena/cincuentena más cercana es una práctica normal).
+const TOLERANCIA_PESOS = 50;
+const TOLERANCIA_PCT = 3; // %
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error('✗ Falta SUPABASE_URL o SUPABASE_SERVICE_KEY. Cortando.');
@@ -229,6 +230,20 @@ async function tnSetStock(product_id, variant_id, stock) {
   return res.json();
 }
 
+async function tnSetPrice(product_id, variant_id, price) {
+  const res = await fetch(`${TN_BASE}/products/${product_id}/variants/${variant_id}`, {
+    method: 'PUT',
+    headers: {
+      'Authentication': `bearer ${TN_TOKEN}`,
+      'User-Agent': TN_USER_AGENT,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ price: String(price) })
+  });
+  if (!res.ok) throw new Error(`TN PUT precio variante ${variant_id} → ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 4.5) AUDITORÍA DE PRECIOS — SOLO LECTURA, nunca escribe en Tienda Nube.
 //      Compara precio_venta(Ops) × 1.10 contra el price real en TN, por SKU.
@@ -295,6 +310,62 @@ async function auditarPrecios() {
     sin_precio_en_tn: sinPrecioTN,
     sku_sin_match_en_ops: noEnOps,
     variantes_sin_sku: sinSku.length
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4.6) CORRECCIÓN PUNTUAL — caso "cero margen aplicado" (TN == precio_ops exacto)
+//      Por defecto es DRY RUN (solo reporta). Escribe solo si se pide explícito.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function corregirSinMargen(escribir) {
+  const ctx = await cargarDatosOps();
+  const variantes = await cargarVariantesTN();
+
+  const candidatos = [];
+  for (const v of variantes) {
+    if (!v.sku) continue;
+    const p = ctx.porCodigo.get(v.sku);
+    if (!p) continue;
+    if (ctx.combosCodigos.has(v.sku)) continue;
+    if (p.precio_venta == null || v.price == null) continue;
+
+    // El caso específico: TN tiene EXACTAMENTE el precio de Ops, sin el +10%.
+    if (v.price === Number(p.precio_venta)) {
+      const nuevoPrecio = Math.round(Number(p.precio_venta) * MARGEN_TIENDA * 100) / 100;
+      candidatos.push({
+        sku: v.sku,
+        nombre: p.nombre,
+        precio_ops: Number(p.precio_venta),
+        precio_tn_actual: v.price,
+        precio_tn_nuevo: nuevoPrecio,
+        product_id: v.product_id,
+        variant_id: v.variant_id
+      });
+    }
+  }
+
+  let escritos = 0;
+  const erroresEscritura = [];
+  if (escribir) {
+    for (const c of candidatos) {
+      try {
+        await tnSetPrice(c.product_id, c.variant_id, c.precio_tn_nuevo);
+        escritos++;
+        await esperar(400); // rate limit
+      } catch (err) {
+        erroresEscritura.push({ sku: c.sku, error: err.message });
+      }
+    }
+  }
+
+  return {
+    ts: new Date().toISOString(),
+    modo: escribir ? 'ESCRITURA REAL' : 'REPORTE (no escribió nada)',
+    candidatos_cantidad: candidatos.length,
+    candidatos,
+    escritos,
+    errores_escritura: erroresEscritura
   };
 }
 
@@ -440,6 +511,15 @@ http.createServer((req, res) => {
         res.end(JSON.stringify(ultimaAuditoriaPrecios, null, 2));
       })
       .finally(() => { auditando = false; });
+  } else if (req.url.startsWith('/corregir-precios-sin-margen')) {
+    // Por defecto (sin ?confirmar=si) es SOLO REPORTE: nunca escribe. Hay que pedirlo explícito.
+    const escribir = req.url.includes('confirmar=si');
+    corregirSinMargen(escribir)
+      .then(resultado => res.end(JSON.stringify(resultado, null, 2)))
+      .catch(err => {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ estado: 'error', error: err.message }, null, 2));
+      });
   } else {
     res.end(JSON.stringify({
       servicio: 'belavita-stock-sync',
