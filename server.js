@@ -52,8 +52,10 @@ const TN_BASE = `https://api.tiendanube.com/v1/${TN_STORE_ID}`;
 // Guardamos el último reporte en memoria para poder verlo por HTTP (GET /reporte).
 let ultimoReporte = { estado: 'todavía no corrió', ts: null };
 let ultimaAuditoriaPrecios = { estado: 'todavía no corrió', ts: null };
+let ultimaCorreccionMasiva = { estado: 'todavía no corrió', ts: null };
 let corriendo = false;
 let auditando = false;
+let corrigiendoMasivo = false;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1) LECTURA DE SUPABASE
@@ -411,31 +413,42 @@ async function corregirTodosPrecios(escribir) {
     });
   }
 
-  let escritos = 0;
-  const erroresEscritura = [];
-  if (escribir) {
-    for (const c of candidatos) {
-      try {
-        await tnSetPrice(c.product_id, c.variant_id, c.precio_tn_nuevo);
-        escritos++;
-        await esperar(400); // rate limit
-      } catch (err) {
-        erroresEscritura.push({ sku: c.sku, error: err.message });
-      }
-    }
-  }
-
-  return {
+  // Reporte inicial (antes de arrancar a escribir), para poder ver el plan completo ya mismo.
+  ultimaCorreccionMasiva = {
+    estado: escribir ? 'escribiendo' : 'ok',
     ts: new Date().toISOString(),
-    modo: escribir ? 'ESCRITURA REAL' : 'REPORTE (no escribió nada)',
+    modo: escribir ? 'ESCRITURA REAL (en curso)' : 'REPORTE (no escribió nada)',
     ya_correctos: yaCorrectos,
     candidatos_cantidad: candidatos.length,
     candidatos,
     sin_precio_venta_en_ops: sinPrecioOps,
     sin_precio_en_tn: sinPrecioTN,
-    escritos,
-    errores_escritura: erroresEscritura
+    escritos: 0,
+    errores_escritura: []
   };
+
+  if (!escribir) return ultimaCorreccionMasiva;
+
+  // Escritura en segundo plano: actualiza el progreso en memoria después de cada una,
+  // así /corregir-todos-precios/estado siempre refleja el avance real sin esperar el final.
+  let escritos = 0;
+  const erroresEscritura = [];
+  for (const c of candidatos) {
+    try {
+      await tnSetPrice(c.product_id, c.variant_id, c.precio_tn_nuevo);
+      escritos++;
+    } catch (err) {
+      erroresEscritura.push({ sku: c.sku, error: err.message });
+    }
+    ultimaCorreccionMasiva.escritos = escritos;
+    ultimaCorreccionMasiva.errores_escritura = erroresEscritura;
+    await esperar(400); // rate limit
+  }
+
+  ultimaCorreccionMasiva.estado = 'completo';
+  ultimaCorreccionMasiva.modo = 'ESCRITURA REAL (completa)';
+  ultimaCorreccionMasiva.ts_fin = new Date().toISOString();
+  return ultimaCorreccionMasiva;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -589,15 +602,38 @@ http.createServer((req, res) => {
         res.statusCode = 500;
         res.end(JSON.stringify({ estado: 'error', error: err.message }, null, 2));
       });
+  } else if (req.url.startsWith('/corregir-todos-precios/estado')) {
+    res.end(JSON.stringify(ultimaCorreccionMasiva, null, 2));
   } else if (req.url.startsWith('/corregir-todos-precios')) {
-    // Por defecto (sin ?confirmar=si) es SOLO REPORTE: nunca escribe. Hay que pedirlo explícito.
     const escribir = req.url.includes('confirmar=si');
-    corregirTodosPrecios(escribir)
-      .then(resultado => res.end(JSON.stringify(resultado, null, 2)))
-      .catch(err => {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ estado: 'error', error: err.message }, null, 2));
-      });
+    if (!escribir) {
+      // Reporte: es rápido, esperamos la respuesta completa como siempre.
+      corregirTodosPrecios(false)
+        .then(resultado => res.end(JSON.stringify(resultado, null, 2)))
+        .catch(err => {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ estado: 'error', error: err.message }, null, 2));
+        });
+    } else {
+      // Escritura: puede tardar varios minutos (cientos de escrituras). NO esperamos
+      // acá — la disparamos en segundo plano y respondemos al toque, así el proxy de
+      // Railway no corta la conexión por timeout. El progreso se consulta aparte en
+      // /corregir-todos-precios/estado.
+      if (corrigiendoMasivo) {
+        res.end(JSON.stringify({ ok: false, mensaje: 'ya hay una corrección masiva en curso, mirá /corregir-todos-precios/estado' }, null, 2));
+        return;
+      }
+      corrigiendoMasivo = true;
+      corregirTodosPrecios(true)
+        .catch(err => {
+          ultimaCorreccionMasiva = { estado: 'error', ts: new Date().toISOString(), error: err.message };
+        })
+        .finally(() => { corrigiendoMasivo = false; });
+      res.end(JSON.stringify({
+        ok: true,
+        mensaje: 'corrección masiva disparada en segundo plano. Consultá el progreso en /corregir-todos-precios/estado (tarda varios minutos).'
+      }, null, 2));
+    }
   } else {
     res.end(JSON.stringify({
       servicio: 'belavita-stock-sync',
