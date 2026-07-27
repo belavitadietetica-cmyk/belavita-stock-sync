@@ -370,6 +370,75 @@ async function corregirSinMargen(escribir) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 4.7) CORRECCIÓN MASIVA — fuerza TODOS los precios (no combo) a precio_venta×1.10
+//      Por defecto es DRY RUN (solo reporta). Escribe solo si se pide explícito.
+//      A diferencia de corregirSinMargen, esta no distingue el motivo del desvío:
+//      simplemente deja cada precio de Tienda Nube exactamente en +10% sobre Ops.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function corregirTodosPrecios(escribir) {
+  const ctx = await cargarDatosOps();
+  const variantes = await cargarVariantesTN();
+
+  const candidatos = [];
+  const sinPrecioOps = [];
+  const sinPrecioTN = [];
+  let yaCorrectos = 0;
+
+  for (const v of variantes) {
+    if (!v.sku) continue;
+    const p = ctx.porCodigo.get(v.sku);
+    if (!p) continue;
+    if (ctx.combosCodigos.has(v.sku)) continue; // combos: precio promocional fijo, no tocar
+    if (p.precio_venta == null) { sinPrecioOps.push({ sku: v.sku, nombre: p.nombre }); continue; }
+    if (v.price == null) { sinPrecioTN.push({ sku: v.sku, nombre: p.nombre, precio_ops: p.precio_venta }); continue; }
+
+    const nuevoPrecio = Math.round(Number(p.precio_venta) * MARGEN_TIENDA * 100) / 100;
+
+    if (v.price === nuevoPrecio) { yaCorrectos++; continue; }
+
+    candidatos.push({
+      sku: v.sku,
+      nombre: p.nombre,
+      precio_ops: Number(p.precio_venta),
+      precio_tn_actual: v.price,
+      precio_tn_nuevo: nuevoPrecio,
+      diferencia: Math.round((v.price - nuevoPrecio) * 100) / 100,
+      // aviso informativo (no bloquea nada): salto grande = vale la pena mirar el producto en TN
+      atencion_salto_grande: Math.abs(v.price - nuevoPrecio) > Math.max(500, nuevoPrecio * 0.3),
+      product_id: v.product_id,
+      variant_id: v.variant_id
+    });
+  }
+
+  let escritos = 0;
+  const erroresEscritura = [];
+  if (escribir) {
+    for (const c of candidatos) {
+      try {
+        await tnSetPrice(c.product_id, c.variant_id, c.precio_tn_nuevo);
+        escritos++;
+        await esperar(400); // rate limit
+      } catch (err) {
+        erroresEscritura.push({ sku: c.sku, error: err.message });
+      }
+    }
+  }
+
+  return {
+    ts: new Date().toISOString(),
+    modo: escribir ? 'ESCRITURA REAL' : 'REPORTE (no escribió nada)',
+    ya_correctos: yaCorrectos,
+    candidatos_cantidad: candidatos.length,
+    candidatos,
+    sin_precio_venta_en_ops: sinPrecioOps,
+    sin_precio_en_tn: sinPrecioTN,
+    escritos,
+    errores_escritura: erroresEscritura
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 5) CORRIDA COMPLETA — calcula, reporta y (si DRY_RUN=false) escribe
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -515,6 +584,15 @@ http.createServer((req, res) => {
     // Por defecto (sin ?confirmar=si) es SOLO REPORTE: nunca escribe. Hay que pedirlo explícito.
     const escribir = req.url.includes('confirmar=si');
     corregirSinMargen(escribir)
+      .then(resultado => res.end(JSON.stringify(resultado, null, 2)))
+      .catch(err => {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ estado: 'error', error: err.message }, null, 2));
+      });
+  } else if (req.url.startsWith('/corregir-todos-precios')) {
+    // Por defecto (sin ?confirmar=si) es SOLO REPORTE: nunca escribe. Hay que pedirlo explícito.
+    const escribir = req.url.includes('confirmar=si');
+    corregirTodosPrecios(escribir)
       .then(resultado => res.end(JSON.stringify(resultado, null, 2)))
       .catch(err => {
         res.statusCode = 500;
