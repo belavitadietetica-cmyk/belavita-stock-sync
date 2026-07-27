@@ -30,6 +30,11 @@ const PORT          = process.env.PORT || 3000;
 const SUCURSALES_FISICAS = ['bv1', 'bv2', 'bv3'];
 // Margen de seguridad que se le resta al stock de granel (en kg), para no vender lo último.
 const MARGEN_GRANEL_KG = 1;
+// Margen de venta que Tienda Nube debe reflejar sobre el precio de Ops.
+const MARGEN_TIENDA = 1.10;
+// Tolerancia para no marcar como "desvío" simples diferencias de redondeo.
+const TOLERANCIA_PESOS = 3;
+const TOLERANCIA_PCT = 0.5; // %
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error('✗ Falta SUPABASE_URL o SUPABASE_SERVICE_KEY. Cortando.');
@@ -45,7 +50,9 @@ const TN_BASE = `https://api.tiendanube.com/v1/${TN_STORE_ID}`;
 
 // Guardamos el último reporte en memoria para poder verlo por HTTP (GET /reporte).
 let ultimoReporte = { estado: 'todavía no corrió', ts: null };
+let ultimaAuditoriaPrecios = { estado: 'todavía no corrió', ts: null };
 let corriendo = false;
+let auditando = false;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1) LECTURA DE SUPABASE
@@ -75,7 +82,7 @@ async function cargarDatosOps() {
   // Nuestras tablas son más grandes (productos y stock_sucursal pasan las 1000),
   // así que hay que paginar con .range() y traer TODO en tandas, o si no el sync
   // ve solo una parte del catálogo y del stock.
-  const productos = await traerTodo('productos', 'id, codigo, nombre, tipo_venta, kg_por_unidad, producto_bulk_id, stock_kg_actual');
+  const productos = await traerTodo('productos', 'id, codigo, nombre, tipo_venta, kg_por_unidad, producto_bulk_id, stock_kg_actual, precio_venta, activo, se_vende');
   const stockSuc  = await traerTodo('stock_sucursal', 'producto_id, sucursal_id, cantidad');
   const combos    = await traerTodo('combo_componentes', 'combo_codigo, componente_codigo, cantidad');
 
@@ -105,7 +112,9 @@ async function cargarDatosOps() {
     componentesPorCombo.set(String(c.combo_codigo), arr);
   }
 
-  return { porCodigo, porId, stockFisicoPorId, componentesPorCombo };
+  const combosCodigos = new Set(componentesPorCombo.keys());
+
+  return { porCodigo, porId, stockFisicoPorId, componentesPorCombo, combosCodigos };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -189,7 +198,9 @@ async function cargarVariantesTN() {
           variant_id: v.id,
           sku: v.sku ? String(v.sku).trim() : null,
           stock_actual: v.stock,                       // puede ser null = ilimitado
-          stock_management: v.stock_management !== false // false = no lleva control de stock
+          stock_management: v.stock_management !== false, // false = no lleva control de stock
+          price: (v.price != null && v.price !== '') ? Number(v.price) : null,
+          promotional_price: (v.promotional_price != null && v.promotional_price !== '') ? Number(v.promotional_price) : null
         });
       }
     }
@@ -216,6 +227,75 @@ async function tnSetStock(product_id, variant_id, stock) {
   });
   if (!res.ok) throw new Error(`TN PUT variante ${variant_id} → ${res.status} ${await res.text()}`);
   return res.json();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4.5) AUDITORÍA DE PRECIOS — SOLO LECTURA, nunca escribe en Tienda Nube.
+//      Compara precio_venta(Ops) × 1.10 contra el price real en TN, por SKU.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function coincidePrecio(esperado, real) {
+  const diff = Math.abs(real - esperado);
+  const pct = esperado > 0 ? (diff / esperado) * 100 : 0;
+  return diff <= TOLERANCIA_PESOS || pct <= TOLERANCIA_PCT;
+}
+
+async function auditarPrecios() {
+  const ctx = await cargarDatosOps();
+  const variantes = await cargarVariantesTN();
+
+  const desviados = [];        // precio de TN no coincide con precio_venta*1.10
+  const sinPrecioOps = [];     // SKU existe en Ops pero sin precio_venta cargado
+  const sinPrecioTN = [];      // SKU tiene precio_venta en Ops pero TN no tiene price
+  const combosOmitidos = [];   // combos: se excluyen del chequeo +10% (precio promo fijo)
+  const noEnOps = [];          // SKU de TN que no existe en Ops
+  const sinSku = [];           // variantes de TN sin SKU
+  let coinciden = 0;
+
+  for (const v of variantes) {
+    if (!v.sku) { sinSku.push(v.variant_id); continue; }
+    const p = ctx.porCodigo.get(v.sku);
+    if (!p) { noEnOps.push(v.sku); continue; }
+
+    if (ctx.combosCodigos.has(v.sku)) { combosOmitidos.push(v.sku); continue; }
+
+    if (p.precio_venta == null) { sinPrecioOps.push({ sku: v.sku, nombre: p.nombre }); continue; }
+    if (v.price == null) { sinPrecioTN.push({ sku: v.sku, nombre: p.nombre, precio_ops: p.precio_venta }); continue; }
+
+    const esperado = Math.round(Number(p.precio_venta) * MARGEN_TIENDA * 100) / 100;
+    const real = v.price;
+
+    if (coincidePrecio(esperado, real)) { coinciden++; continue; }
+
+    desviados.push({
+      sku: v.sku,
+      nombre: p.nombre,
+      precio_ops: Number(p.precio_venta),
+      esperado_en_tn: esperado,
+      real_en_tn: real,
+      diferencia: Math.round((real - esperado) * 100) / 100,
+      diferencia_pct: esperado > 0 ? Math.round(((real - esperado) / esperado) * 10000) / 100 : null,
+      promotional_price_tn: v.promotional_price,
+      product_id: v.product_id,
+      variant_id: v.variant_id
+    });
+  }
+
+  desviados.sort((a, b) => Math.abs(b.diferencia) - Math.abs(a.diferencia));
+
+  return {
+    ts: new Date().toISOString(),
+    total_variantes_tn: variantes.length,
+    coinciden,
+    desviados_cantidad: desviados.length,
+    desviados,
+    combos_omitidos_cantidad: combosOmitidos.length,
+    combos_omitidos: combosOmitidos,
+    sin_precio_venta_en_ops: sinPrecioOps,
+    sin_precio_en_tn: sinPrecioTN,
+    sku_sin_match_en_ops: noEnOps,
+    variantes_sin_sku: sinSku.length
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -342,6 +422,24 @@ http.createServer((req, res) => {
   } else if (req.url === '/forzar') {
     correr(); // dispara una corrida manual (no espera a que termine)
     res.end(JSON.stringify({ ok: true, mensaje: 'corrida disparada, ver /reporte en unos segundos' }));
+  } else if (req.url === '/auditoria-precios') {
+    // Solo lectura: nunca escribe en Tienda Nube. Corre sincrónico y devuelve el resultado directo.
+    if (auditando) {
+      res.end(JSON.stringify({ ok: false, mensaje: 'ya hay una auditoría en curso, esperá unos segundos' }));
+      return;
+    }
+    auditando = true;
+    auditarPrecios()
+      .then(resultado => {
+        ultimaAuditoriaPrecios = { estado: 'ok', ...resultado };
+        res.end(JSON.stringify(ultimaAuditoriaPrecios, null, 2));
+      })
+      .catch(err => {
+        ultimaAuditoriaPrecios = { estado: 'error', ts: new Date().toISOString(), error: err.message };
+        res.statusCode = 500;
+        res.end(JSON.stringify(ultimaAuditoriaPrecios, null, 2));
+      })
+      .finally(() => { auditando = false; });
   } else {
     res.end(JSON.stringify({
       servicio: 'belavita-stock-sync',
