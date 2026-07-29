@@ -98,13 +98,19 @@ async function cargarDatosOps() {
   }
 
   // Suma de stock físico (bv1+bv2+bv3) por producto_id.
+  // `detallePorId` guarda además el desglose sucursal por sucursal: no lo usa el
+  // cálculo, sirve para el diagnóstico por SKU (GET /diagnostico-stock).
   const stockFisicoPorId = new Map();
+  const detallePorId = new Map();
   for (const row of stockSuc) {
     const suc = String(row.sucursal_id || '').toLowerCase();
     if (!SUCURSALES_FISICAS.includes(suc)) continue; // ignora bvt u otros
     const pid = Number(row.producto_id);
-    const acum = stockFisicoPorId.get(pid) || 0;
-    stockFisicoPorId.set(pid, acum + (Number(row.cantidad) || 0));
+    const cant = Number(row.cantidad) || 0;
+    stockFisicoPorId.set(pid, (stockFisicoPorId.get(pid) || 0) + cant);
+    const det = detallePorId.get(pid) || {};
+    det[suc] = (det[suc] || 0) + cant;
+    detallePorId.set(pid, det);
   }
 
   // Componentes agrupados por combo.
@@ -117,7 +123,7 @@ async function cargarDatosOps() {
 
   const combosCodigos = new Set(componentesPorCombo.keys());
 
-  return { porCodigo, porId, stockFisicoPorId, componentesPorCombo, combosCodigos };
+  return { porCodigo, porId, stockFisicoPorId, detallePorId, componentesPorCombo, combosCodigos };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -218,6 +224,15 @@ async function cargarVariantesTN() {
 // 4) ESCRITURA EN TIENDA NUBE — setea el stock absoluto de una variante
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Escribe el stock ABSOLUTO y además fuerza `stock_management: true`.
+//
+// El `stock_management: true` no está de adorno: si una variante quedó con el
+// control de stock apagado en Tienda Nube (pasa cuando otra escritura sobre la
+// misma variante lo deja así — por ejemplo una corrección de precios), esta
+// función seguía devolviendo 200 OK pero el número no se reflejaba en la tienda:
+// TN trata a esa variante como "sin control", ignora el stock y la muestra como
+// ilimitada. Mandando el flag en cada escritura, el sync REACTIVA el control y
+// se autocorrige solo en la corrida siguiente, sin tener que tocar nada a mano.
 async function tnSetStock(product_id, variant_id, stock) {
   const res = await fetch(`${TN_BASE}/products/${product_id}/variants/${variant_id}`, {
     method: 'PUT',
@@ -226,12 +241,16 @@ async function tnSetStock(product_id, variant_id, stock) {
       'User-Agent': TN_USER_AGENT,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ stock })
+    body: JSON.stringify({ stock, stock_management: true })
   });
   if (!res.ok) throw new Error(`TN PUT variante ${variant_id} → ${res.status} ${await res.text()}`);
   return res.json();
 }
 
+// Escribe SOLO el precio, pero manda explícitamente `stock_management: true`
+// para no dejar la variante sin control de stock como efecto colateral.
+// Esta es la contracara del bug de arriba: acá se evita que se produzca, y en
+// tnSetStock se repara si ya se produjo.
 async function tnSetPrice(product_id, variant_id, price) {
   const res = await fetch(`${TN_BASE}/products/${product_id}/variants/${variant_id}`, {
     method: 'PUT',
@@ -240,7 +259,7 @@ async function tnSetPrice(product_id, variant_id, price) {
       'User-Agent': TN_USER_AGENT,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ price: String(price) })
+    body: JSON.stringify({ price: String(price), stock_management: true })
   });
   if (!res.ok) throw new Error(`TN PUT precio variante ${variant_id} → ${res.status} ${await res.text()}`);
   return res.json();
@@ -452,6 +471,67 @@ async function corregirTodosPrecios(escribir) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 4.8) DIAGNÓSTICO POR SKU — SOLO LECTURA. Muestra la cadena completa de un
+//      producto: fila por fila de stock_sucursal, la suma, lo que el motor
+//      calcula, y lo que Tienda Nube tiene hoy guardado (con su stock_management).
+//      Sirve para responder en 5 segundos "¿por qué este producto muestra mal?".
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function diagnosticoStock(sku) {
+  const codigo = String(sku).trim();
+  const ctx = await cargarDatosOps();
+  const p = ctx.porCodigo.get(codigo);
+
+  if (!p) {
+    return {
+      ts: new Date().toISOString(),
+      sku: codigo,
+      encontrado_en_ops: false,
+      mensaje: 'Ese código no existe en ops.productos. Si el SKU está en Tienda Nube, el sync lo ignora a propósito (no toca lo que no reconoce).'
+    };
+  }
+
+  const calc = calcularStock(codigo, ctx);
+  const variantes = await cargarVariantesTN();
+  const enTN = variantes.filter(v => v.sku === codigo);
+
+  return {
+    ts: new Date().toISOString(),
+    sku: codigo,
+    encontrado_en_ops: true,
+    producto: {
+      id: p.id,
+      nombre: p.nombre,
+      tipo_venta: p.tipo_venta,
+      producto_bulk_id: p.producto_bulk_id,
+      kg_por_unidad: p.kg_por_unidad,
+      stock_kg_actual: p.stock_kg_actual,
+      precio_venta: p.precio_venta,
+      activo: p.activo,
+      se_vende: p.se_vende
+    },
+    stock_por_sucursal: ctx.detallePorId.get(Number(p.id)) || {},
+    suma_bv1_bv2_bv3: ctx.stockFisicoPorId.get(Number(p.id)) || 0,
+    calculado_por_el_motor: calc,
+    en_tienda_nube: enTN.map(v => ({
+      product_id: v.product_id,
+      variant_id: v.variant_id,
+      stock_guardado: v.stock_actual,
+      control_de_stock_activo: v.stock_management,
+      price: v.price,
+      promotional_price: v.promotional_price,
+      // La causa más común de "muestra mal": el control apagado. Con el control en
+      // false, TN ignora el número y la variante se comporta como ilimitada.
+      diagnostico: !v.stock_management
+        ? '⚠ CONTROL DE STOCK APAGADO en TN — por eso no refleja la suma. La próxima corrida lo reactiva.'
+        : (Number(v.stock_actual) === (calc ? calc.stock : null) ? '✓ coincide' : 'difiere: la próxima corrida lo corrige')
+    })),
+    variantes_en_tn: enTN.length,
+    modo_servicio: DRY_RUN ? 'REPORTE (DRY_RUN=true — NO escribe en TN)' : 'ESCRITURA REAL'
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 5) CORRIDA COMPLETA — calcula, reporta y (si DRY_RUN=false) escribe
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -486,14 +566,21 @@ async function correr() {
       const actual = (v.stock_actual == null) ? null : Number(v.stock_actual);
       const p = ctx.porCodigo.get(String(v.sku));
 
-      if (actual === objetivo) { iguales++; continue; }
+      // Si la variante tiene el control de stock APAGADO en Tienda Nube, hay que
+      // reescribirla aunque el número coincida: el objetivo real no es el número,
+      // es volver a prenderle el control. Si no forzamos esto, una variante que
+      // quedó "sin control" pero con el número correcto guardado nunca se repara.
+      const necesitaReactivar = !v.stock_management;
+
+      if (actual === objetivo && !necesitaReactivar) { iguales++; continue; }
       cambios.push({
         sku: v.sku,
         nombre: p ? p.nombre : '(?)',
         tipo: calc.tipo,
         de: actual,
         a: objetivo,
-        detalle: calc.detalle,
+        detalle: calc.detalle + (necesitaReactivar ? ' · REACTIVA control de stock' : ''),
+        reactiva_control: necesitaReactivar,
         product_id: v.product_id,
         variant_id: v.variant_id
       });
@@ -525,7 +612,12 @@ async function correr() {
     console.log(`  Por tipo → normal:${porTipo.normal} · kilo_online:${porTipo.kilo_online} · combo:${porTipo.combo} · granel:${porTipo.granel}`);
     console.log(`  Normales con stock > 0: ${normalesConStock}  ${normalesConStock === 0 ? '⚠ SOSPECHOSO: revisar relación stock_sucursal.producto_id ↔ productos.id' : '✓'}`);
     console.log(`  Sin cambios: ${iguales} · Cambiarían: ${cambios.length}`);
-    console.log(`  SKU sin match en Ops: ${noEnOps.length} · Variantes sin SKU: ${sinSku.length} · Sin control de stock en TN: ${sinControl.length}`);
+    console.log(`  SKU sin match en Ops: ${noEnOps.length} · Variantes sin SKU: ${sinSku.length}`);
+    // Esta línea es la que hay que mirar cuando la tienda "no muestra el stock real":
+    // una variante sin control de stock ignora cualquier número que le escribamos.
+    const aReactivar = cambios.filter(c => c.reactiva_control).length;
+    console.log(`  Sin control de stock en TN: ${sinControl.length}  ${sinControl.length ? `⚠ se les reactiva el control en esta corrida (${aReactivar} escrituras)` : '✓'}`);
+    if (sinControl.length) console.log('  ── SKU con control apagado (primeros 30): ' + sinControl.slice(0, 30).join(', '));
     if (!DRY_RUN) console.log(`  Escritos en TN: ${escritos}/${cambios.length} · Errores: ${erroresEscritura.length}`);
 
     if (cambios.length) {
@@ -550,7 +642,9 @@ async function correr() {
       errores_escritura: erroresEscritura,
       sku_sin_match_ops: noEnOps,
       variantes_sin_sku: sinSku.length,
+      sin_control_stock_cantidad: sinControl.length,
       sin_control_stock: sinControl,
+      reactivaciones_control: cambios.filter(c => c.reactiva_control).length,
       cambios // lista completa (para inspección por GET /reporte)
     };
     console.log(`✔ Corrida OK en ${Date.now() - t0}ms`);
@@ -575,6 +669,19 @@ http.createServer((req, res) => {
   } else if (req.url === '/forzar') {
     correr(); // dispara una corrida manual (no espera a que termine)
     res.end(JSON.stringify({ ok: true, mensaje: 'corrida disparada, ver /reporte en unos segundos' }));
+  } else if (req.url.startsWith('/diagnostico-stock')) {
+    // Solo lectura. Uso: /diagnostico-stock?sku=1234
+    const sku = (req.url.split('sku=')[1] || '').split('&')[0];
+    if (!sku) {
+      res.end(JSON.stringify({ ok: false, mensaje: 'Pasá un SKU. Ejemplo: /diagnostico-stock?sku=1234' }, null, 2));
+      return;
+    }
+    diagnosticoStock(decodeURIComponent(sku))
+      .then(r => res.end(JSON.stringify(r, null, 2)))
+      .catch(err => {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ estado: 'error', error: err.message }, null, 2));
+      });
   } else if (req.url === '/auditoria-precios') {
     // Solo lectura: nunca escribe en Tienda Nube. Corre sincrónico y devuelve el resultado directo.
     if (auditando) {
