@@ -100,13 +100,22 @@ async function cargarDatosOps() {
   // Suma de stock físico (bv1+bv2+bv3) por producto_id.
   // `detallePorId` guarda además el desglose sucursal por sucursal: no lo usa el
   // cálculo, sirve para el diagnóstico por SKU (GET /diagnostico-stock).
+  // `conFilaSucursal` es el dato CLAVE del motor: marca qué productos realmente
+  // llevan stock por unidad en las sucursales. Las filas de stock_sucursal se
+  // crean por upsert a demanda (venta en POS, edición de stock, envío entre
+  // sucursales), así que tener fila = "este producto se cuenta por unidad".
+  // Lo que NO tiene fila es lo que existe solo online (presentaciones 9001+).
+  // Se marca por PRESENCIA de fila, no por cantidad > 0: si las 3 sucursales
+  // están en cero, la respuesta honesta es cero, no inventar stock del granel.
   const stockFisicoPorId = new Map();
   const detallePorId = new Map();
+  const conFilaSucursal = new Set();
   for (const row of stockSuc) {
     const suc = String(row.sucursal_id || '').toLowerCase();
     if (!SUCURSALES_FISICAS.includes(suc)) continue; // ignora bvt u otros
     const pid = Number(row.producto_id);
     const cant = Number(row.cantidad) || 0;
+    conFilaSucursal.add(pid);
     stockFisicoPorId.set(pid, (stockFisicoPorId.get(pid) || 0) + cant);
     const det = detallePorId.get(pid) || {};
     det[suc] = (det[suc] || 0) + cant;
@@ -123,16 +132,37 @@ async function cargarDatosOps() {
 
   const combosCodigos = new Set(componentesPorCombo.keys());
 
-  return { porCodigo, porId, stockFisicoPorId, detallePorId, componentesPorCombo, combosCodigos };
+  return { porCodigo, porId, stockFisicoPorId, detallePorId, conFilaSucursal, componentesPorCombo, combosCodigos };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2) MOTOR DE CÁLCULO — dado un código, cuánto stock mostrar en la tienda
 //    Devuelve { stock, tipo, detalle } o null si el código no existe en Ops.
+//
+// ORDEN DE PRECEDENCIA (importa, y este orden es el fix de la corrida del 29/07):
+//   1. Combo               → mínimo de sus componentes
+//   2. Lleva stock por unidad en sucursales → SUMA bv1+bv2+bv3   ← manda esto
+//   3. Granel clásico con código            → stock_kg_actual
+//   4. Solo online (sin filas de sucursal)  → deriva del granel vía producto_bulk_id
+//   5. Nada de lo anterior                  → 0
+//
+// Antes la regla 4 estaba PRIMERA: cualquier producto con `producto_bulk_id`
+// derivaba su stock del granel. Eso estaba mal de raíz, porque en Ops
+// `producto_bulk_id` NO significa "mi stock sale del granel" — significa "esta
+// presentación se fracciona de ese bulto", y lo usa la lógica de compras de
+// Lucas para traducir faltas de góndola a kilos de bulto. Las bolsitas
+// fraccionadas tienen stock REAL propio en stock_sucursal, y el motor se lo
+// estaba ignorando a 324 variantes: mostraba en la tienda los kilos del depósito
+// (o 0, si el depósito estaba vacío) en lugar de las unidades reales de las
+// sucursales. Ese fue el caso de GRANOLA CLASICA X1KG (código 148): tiene
+// unidades en las sucursales, pero el granel estaba en 0 kg y la tienda la
+// mostró en 0. La derivación del granel ahora es el ÚLTIMO recurso, y queda
+// reservada para lo que existe únicamente online (presentaciones 9001+), que es
+// justamente lo que no tiene filas en stock_sucursal.
 // ═══════════════════════════════════════════════════════════════════════════
 
 function calcularStock(codigo, ctx, visitados = new Set()) {
-  const { porCodigo, porId, stockFisicoPorId, componentesPorCombo } = ctx;
+  const { porCodigo, porId, stockFisicoPorId, conFilaSucursal, componentesPorCombo } = ctx;
   const p = porCodigo.get(String(codigo).trim());
   if (!p) return null; // no existe en Ops → no se toca en TN
 
@@ -140,18 +170,7 @@ function calcularStock(codigo, ctx, visitados = new Set()) {
   if (visitados.has(String(codigo))) return { stock: 0, tipo: 'bucle', detalle: 'referencia circular' };
   visitados.add(String(codigo));
 
-  // ── Caso 1: SOLO ONLINE kilo → deriva del granel via producto_bulk_id ──
-  if (p.producto_bulk_id != null) {
-    const granel = porId.get(Number(p.producto_bulk_id));
-    if (!granel) return { stock: 0, tipo: 'kilo_online', detalle: `granel id ${p.producto_bulk_id} no encontrado` };
-    const kg = Number(granel.stock_kg_actual) || 0;
-    const kgPorUnidad = Number(p.kg_por_unidad) || 1;
-    const disponible = Math.max(0, kg - MARGEN_GRANEL_KG);     // margen de seguridad
-    const stock = Math.max(0, Math.floor(disponible / kgPorUnidad));
-    return { stock, tipo: 'kilo_online', detalle: `${kg}kg granel − ${MARGEN_GRANEL_KG} ÷ ${kgPorUnidad}` };
-  }
-
-  // ── Caso 2: Combo → mínimo de (stock de cada componente ÷ cantidad que lleva) ──
+  // ── Regla 1: Combo → mínimo de (stock de cada componente ÷ cantidad que lleva) ──
   const comps = componentesPorCombo.get(String(codigo));
   if (comps && comps.length) {
     let min = Infinity;
@@ -166,16 +185,37 @@ function calcularStock(codigo, ctx, visitados = new Set()) {
     return { stock, tipo: 'combo', detalle: `limita el componente ${cuelloBotella}` };
   }
 
-  // ── Caso 3: Granel clásico con código (tipo_venta granel) → stock_kg_actual ──
+  // ── Regla 2: lleva stock por UNIDAD en las sucursales → suma bv1+bv2+bv3 ──
+  // Tiene prioridad sobre todo lo demás. Si el producto se cuenta por unidad en
+  // los locales, esa es la verdad del stock y punto — sin importar que además
+  // tenga un bulto asociado para la lógica de compras.
+  if (conFilaSucursal.has(Number(p.id))) {
+    const suma = stockFisicoPorId.get(Number(p.id)) || 0;
+    return { stock: Math.max(0, Math.floor(suma)), tipo: 'normal', detalle: `bv1+bv2+bv3 = ${suma}` };
+  }
+
+  // ── Regla 3: Granel clásico con código (tipo_venta granel) → stock_kg_actual ──
   if (String(p.tipo_venta || '').toLowerCase() === 'granel') {
     const kg = Number(p.stock_kg_actual) || 0;
     const stock = Math.max(0, Math.floor(kg - MARGEN_GRANEL_KG));
     return { stock, tipo: 'granel', detalle: `${kg}kg − ${MARGEN_GRANEL_KG}` };
   }
 
-  // ── Caso 4: Normal (bolsita) → suma bv1+bv2+bv3 ──
-  const suma = stockFisicoPorId.get(Number(p.id)) || 0;
-  return { stock: Math.max(0, Math.floor(suma)), tipo: 'normal', detalle: `bv1+bv2+bv3 = ${suma}` };
+  // ── Regla 4: SOLO ONLINE por kilo → deriva del granel vía producto_bulk_id ──
+  // Último recurso: el producto no lleva stock por unidad en ninguna sucursal,
+  // así que lo único que puede respaldarlo es el granel del depósito.
+  if (p.producto_bulk_id != null) {
+    const granel = porId.get(Number(p.producto_bulk_id));
+    if (!granel) return { stock: 0, tipo: 'kilo_online', detalle: `granel id ${p.producto_bulk_id} no encontrado` };
+    const kg = Number(granel.stock_kg_actual) || 0;
+    const kgPorUnidad = Number(p.kg_por_unidad) || 1;
+    const disponible = Math.max(0, kg - MARGEN_GRANEL_KG);     // margen de seguridad
+    const stock = Math.max(0, Math.floor(disponible / kgPorUnidad));
+    return { stock, tipo: 'kilo_online', detalle: `${kg}kg granel − ${MARGEN_GRANEL_KG} ÷ ${kgPorUnidad}` };
+  }
+
+  // ── Regla 5: sin ninguna fuente de stock conocida ──
+  return { stock: 0, tipo: 'sin_fuente', detalle: 'sin filas en stock_sucursal, no es granel y no tiene bulto asociado' };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -511,8 +551,17 @@ async function diagnosticoStock(sku) {
       se_vende: p.se_vende
     },
     stock_por_sucursal: ctx.detallePorId.get(Number(p.id)) || {},
+    lleva_stock_por_unidad_en_sucursales: ctx.conFilaSucursal.has(Number(p.id)),
     suma_bv1_bv2_bv3: ctx.stockFisicoPorId.get(Number(p.id)) || 0,
     calculado_por_el_motor: calc,
+    regla_aplicada: calc ? ({
+      combo: '1 · combo → mínimo de componentes',
+      normal: '2 · lleva stock por unidad en sucursales → suma bv1+bv2+bv3',
+      granel: '3 · granel clásico con código → stock_kg_actual',
+      kilo_online: '4 · solo online → deriva del granel (último recurso)',
+      sin_fuente: '5 · sin fuente de stock conocida → 0',
+      bucle: 'referencia circular en el combo'
+    }[calc.tipo] || calc.tipo) : null,
     en_tienda_nube: enTN.map(v => ({
       product_id: v.product_id,
       variant_id: v.variant_id,
@@ -552,7 +601,7 @@ async function correr() {
     const noEnOps = [];       // SKU de TN que no existe en Ops
     const sinControl = [];    // SKU con stock_management=false (no guarda stock)
     let iguales = 0;
-    const porTipo = { normal: 0, kilo_online: 0, combo: 0, granel: 0 };
+    const porTipo = { normal: 0, kilo_online: 0, combo: 0, granel: 0, sin_fuente: 0 };
 
     for (const v of variantes) {
       if (!v.sku) { sinSku.push(v.variant_id); continue; }
@@ -609,7 +658,8 @@ async function correr() {
 
     // ── Reporte por consola (resumen + muestra + anomalías) ──
     console.log(`  Variantes TN leídas: ${variantes.length}`);
-    console.log(`  Por tipo → normal:${porTipo.normal} · kilo_online:${porTipo.kilo_online} · combo:${porTipo.combo} · granel:${porTipo.granel}`);
+    console.log(`  Por tipo → normal:${porTipo.normal} · kilo_online:${porTipo.kilo_online} · combo:${porTipo.combo} · granel:${porTipo.granel} · sin_fuente:${porTipo.sin_fuente}`);
+    if (porTipo.sin_fuente) console.log(`     ↳ "sin_fuente" = producto sin filas en stock_sucursal, que no es granel y no tiene bulto asociado. Se manda 0. Revisar esas fichas en Ops.`);
     console.log(`  Normales con stock > 0: ${normalesConStock}  ${normalesConStock === 0 ? '⚠ SOSPECHOSO: revisar relación stock_sucursal.producto_id ↔ productos.id' : '✓'}`);
     console.log(`  Sin cambios: ${iguales} · Cambiarían: ${cambios.length}`);
     console.log(`  SKU sin match en Ops: ${noEnOps.length} · Variantes sin SKU: ${sinSku.length}`);
